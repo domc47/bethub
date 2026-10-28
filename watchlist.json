@@ -1,0 +1,43 @@
+{
+ "updated": 1793221289,
+ "lookback_days": 90,
+ "wallets": [
+  {
+   "wallet": "0x6bab66c4bb24c96ed14dcca0f0979b38a6830fe5",
+   "name": "0x6bAB66c4BB24c96Ed14dccA0f0979B38a6830FE5-1760703674960",
+   "score": 0.2853,
+   "boards": [
+    "Politics month #25"
+   ],
+   "stat": "90d big bets: ROI +12%, edge +7.1 pts, CLV +43.3\u00a2, profitable 3/3 months\nSells before resolution 62% of the time - watch for exit alerts"
+  },
+  {
+   "wallet": "0xa2cced8bfae7d645f7f437fb76becf2fcbb70cbc",
+   "name": "justwins",
+   "score": 0.2367,
+   "boards": [
+    "Sports month #20"
+   ],
+   "stat": "90d big bets: ROI +38%, edge +20.0 pts, CLV +16.4\u00a2, profitable 2/3 months\nSells before resolution 0% of the time - mostly holds"
+  },
+  {
+   "wallet": "0xe9b710551dd82a44e79203c2394a2b10163ace7b",
+   "name": "googleplay",
+   "score": 0.1793,
+   "boards": [
+    "Overall month #10",
+    "Sports month #6"
+   ],
+   "stat": "90d big bets: ROI +43%, edge +27.1 pts, CLV +10.7\u00a2, profitable 2/3 months\nSells before resolution 2% of the time - mostly holds"
+  },
+  {
+   "wallet": "0x2dfa4e79eca44b7c774f40a45535adbc368a6f60",
+   "name": "BillyGating",
+   "score": 0.0936,
+   "boards": [
+    "Sports month #17"
+   ],
+   "stat": "90d big bets: ROI +26%, edge +13.7 pts, CLV +9.0\u00a2, profitable 3/3 months\nSells before resolution 0% of the time - mostly holds"
+  }
+ ]
+}
