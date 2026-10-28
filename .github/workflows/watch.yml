@@ -30,7 +30,6 @@ jobs:
           PM_WALLET: ${{ vars.PM_WALLET }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           MIN_USD: "1000"
-         
           BUYS_ONLY: "true"
 
       - name: Save state
