@@ -3,18 +3,24 @@
 bethub consensus alerts
 
 Pings your phone (via ntfy) when 2+ of the traders you follow hold the SAME
-side of the SAME market. Built to keep your bet count low: max 3 alerts a day.
+side of the SAME market, and warns you later if anyone takes the other side.
 
 Filters:
   - a position only counts if it's big FOR THAT TRADER (vs. their typical bet)
-  - traders holding both sides of a market (hedged) are ignored for it
-  - markets where your traders disagree (opposite sides) are skipped
+  - skips the WHOLE GAME if your traders hold bets pointing opposite ways on it
+    (e.g. one on Hornets, another on Pistons, at any spread or moneyline,
+     or Over vs Under on the same total)
   - skips if the price has run more than MAX_PRICE_DRIFT above their entry
   - only near-term, unsettled markets
+
+Follow-up warnings:
+  - after an alert, if any trader you follow takes the opposite side of that
+    bet, you get one warning ping
 """
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -36,13 +42,16 @@ ALWAYS_FOLLOW = {
 # --------------------------------------------------------------- settings --
 UNIT = 10                    # your 1 unit, in dollars
 MIN_TRADERS = 2              # how many traders must agree
-RELATIVE_SIZE = 0.5          # a position counts if it's >= 50% of that trader's typical bet
+RELATIVE_SIZE = 0.5          # a bet counts toward agreement if >= 50% of that trader's typical bet
 MIN_POSITION_FLOOR = 500     # ...and never below this many dollars
+CONFLICT_RELATIVE_SIZE = 0.25  # an opposite bet counts as a conflict if >= 25% of their typical bet
+CONFLICT_FLOOR = 250         # ...and never below this many dollars
 DUST_USD = 100               # ignore scraps under this when working out "typical"
 MAX_ALERTS_PER_DAY = None    # None = no cap; set a number (e.g. 3) to cap alerts per day
 MAX_PRICE_DRIFT = 0.02       # skip if price is >2¢ above their average entry
 MIN_PRICE, MAX_PRICE = 0.05, 0.95   # skip markets that are basically decided
 MAX_DAYS_OUT = 3             # only markets ending within this many days
+REMEMBER_DAYS = 7            # how long to remember alerts (no repeats, warnings)
 
 TIMEZONE = os.getenv("TZ_NAME", "America/New_York")   # when your "day" resets
 STATE_FILE = os.getenv("STATE_FILE", "consensus_state.json")
@@ -110,6 +119,10 @@ def fetch_positions(wallet):
 
 
 # ------------------------------------------------------------------ logic --
+def cost_of(p):
+    return float(p.get("initialValue") or 0)
+
+
 def days_until(end):
     if not end:
         return None
@@ -125,8 +138,8 @@ def days_until(end):
 def typical_bet(positions):
     """Median cost of a trader's open positions, ignoring tiny scraps."""
     costs = sorted(
-        float(p.get("initialValue") or 0) for p in positions
-        if not p.get("redeemable") and float(p.get("initialValue") or 0) >= DUST_USD
+        cost_of(p) for p in positions
+        if not p.get("redeemable") and cost_of(p) >= DUST_USD
     )
     if not costs:
         return 0.0
@@ -134,39 +147,70 @@ def typical_bet(positions):
     return costs[mid] if len(costs) % 2 else (costs[mid - 1] + costs[mid]) / 2
 
 
+def direction(p):
+    """
+    Which way a bet points on its game: (game, axis, direction).
+      - team markets (moneyline, spreads):  axis "team",  direction = team/player
+      - over/under markets:                 axis "total:<market minus line>", Over/Under
+      - Yes/No markets:                     only compared within that one market
+    """
+    game = p.get("eventSlug") or p.get("slug") or p.get("conditionId")
+    outcome = (p.get("outcome") or "").strip().lower()
+    title = (p.get("title") or "").strip().lower()
+    if outcome in ("over", "under"):
+        # "Hornets vs. Pistons: O/U 213.5" and "... O/U 215.5" are the same total;
+        # player props have different titles, so they stay separate.
+        return game, "total:" + re.sub(r"[\d.]+\s*$", "", title).strip(), outcome
+    if outcome in ("yes", "no"):
+        return game, "market:" + str(p.get("conditionId")), outcome
+    return game, "team", outcome
+
+
+def build_directions(all_positions, typical):
+    """game -> axis -> direction -> [(trader, outcome, market title, cost)]"""
+    idx = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for name, positions in all_positions.items():
+        floor = max(CONFLICT_FLOOR, typical[name] * CONFLICT_RELATIVE_SIZE)
+        for p in positions:
+            if p.get("redeemable") or cost_of(p) < floor:
+                continue
+            game, axis, d = direction(p)
+            idx[game][axis][d].append((name, p.get("outcome"), p.get("title"), cost_of(p)))
+    return idx
+
+
+def conflicted_games(idx):
+    """Games where your traders hold bets pointing opposite ways on any axis."""
+    return {g for g, axes in idx.items() if any(len(dirs) > 1 for dirs in axes.values())}
+
+
 def find_consensus(all_positions):
-    """all_positions: {trader_name: [position, ...]} -> ranked list of picks."""
-    sides = defaultdict(dict)        # (conditionId, outcomeIndex) -> {name: pos}
+    """Returns (ranked picks, direction index)."""
     typical = {}
+    sides = defaultdict(dict)        # (conditionId, outcomeIndex) -> {name: pos}
     for name, positions in all_positions.items():
         typical[name] = typical_bet(positions)
         threshold = max(MIN_POSITION_FLOOR, typical[name] * RELATIVE_SIZE)
         print(f"{name}: typical bet ${typical[name]:,.0f}, counting bets >= ${threshold:,.0f}")
-        held = defaultdict(dict)     # conditionId -> {outcomeIndex: pos}
         for p in positions:
-            if p.get("redeemable"):
+            if p.get("redeemable") or cost_of(p) < threshold:
                 continue
-            if float(p.get("initialValue") or 0) < threshold:
-                continue
-            held[p["conditionId"]][p.get("outcomeIndex")] = p
-        for cond, by_idx in held.items():
-            if len(by_idx) > 1:      # holds both sides = hedged, ignore
-                continue
-            idx, p = next(iter(by_idx.items()))
-            sides[(cond, idx)][name] = p
+            sides[(p["conditionId"], p.get("outcomeIndex"))][name] = p
 
-    sides_per_market = defaultdict(set)
-    for cond, idx in sides:
-        sides_per_market[cond].add(idx)
+    idx = build_directions(all_positions, typical)
+    blocked = conflicted_games(idx)
+    if blocked:
+        print(f"Skipping {len(blocked)} games with opposite bets: {', '.join(sorted(blocked))}")
 
     picks = []
-    for (cond, idx), holders in sides.items():
+    for (cond, oi), holders in sides.items():
         if len(holders) < MIN_TRADERS:
             continue
-        if len(sides_per_market[cond]) > 1:   # your traders disagree
+        sample = next(iter(holders.values()))
+        game, axis, d = direction(sample)
+        if game in blocked:
             continue
 
-        sample = next(iter(holders.values()))
         cur = float(sample.get("curPrice") or 0)
         if not (MIN_PRICE <= cur <= MAX_PRICE):
             continue
@@ -174,15 +218,16 @@ def find_consensus(all_positions):
         if left is not None and (left < -1 or left > MAX_DAYS_OUT):
             continue
 
-        cost = sum(float(p["initialValue"]) for p in holders.values())
-        shares = sum(float(p["size"]) for p in holders.values())
+        cost = sum(cost_of(p) for p in holders.values())
+        shares = sum(float(p.get("size") or 0) for p in holders.values())
         avg_entry = cost / shares if shares else cur
         if cur > avg_entry + MAX_PRICE_DRIFT:
             continue
 
         units = 1.5 if len(holders) >= 3 else 1.0
         picks.append({
-            "key": f"{cond}:{idx}",
+            "key": f"{cond}:{oi}",
+            "game": game, "axis": axis, "dir": d,
             "title": sample.get("title", "?"),
             "outcome": sample.get("outcome", "?"),
             "event_slug": sample.get("eventSlug") or sample.get("slug") or "",
@@ -193,15 +238,28 @@ def find_consensus(all_positions):
             "units": units,
             "stake": UNIT * units,
             "holders": sorted(
-                ((n, float(p["initialValue"]), float(p.get("avgPrice") or 0),
-                  float(p["initialValue"]) / typical[n] if typical[n] else 0)
+                ((n, cost_of(p), float(p.get("avgPrice") or 0),
+                  cost_of(p) / typical[n] if typical[n] else 0)
                  for n, p in holders.items()),
                 key=lambda h: -h[1],
             ),
         })
 
     picks.sort(key=lambda x: (x["n"], x["total"]), reverse=True)
-    return picks
+    return picks, idx
+
+
+def find_warnings(state, idx):
+    """Past alerts where a trader you follow now holds the opposite side."""
+    warnings = []
+    for key, info in state["alerted"].items():
+        if info.get("warned") or "game" not in info:
+            continue
+        dirs = idx.get(info["game"], {}).get(info["axis"], {})
+        against = [h for d, hs in dirs.items() if d != info["dir"] for h in hs]
+        if against:
+            warnings.append((key, info, against))
+    return warnings
 
 
 # ------------------------------------------------------------------ alert --
@@ -209,8 +267,25 @@ def cents(x):
     return f"{x * 100:.1f}¢"
 
 
-def send(pick, n_today):
-    title = f"{pick['n']} traders agree: {pick['outcome']}"
+def notify(title, body, tags, event_slug=""):
+    if DRY_RUN or not NTFY_TOPIC:
+        print(f"--- {title}\n{body}\n")
+        return
+    headers = {
+        "Title": title.encode("latin-1", "ignore").decode("latin-1"),
+        "Tags": tags,
+        "Priority": "high",
+    }
+    if event_slug:
+        headers["Click"] = f"https://polymarket.com/event/{event_slug}"
+    req = urllib.request.Request(
+        f"{NTFY_SERVER}/{NTFY_TOPIC}", data=body.encode("utf-8"),
+        headers=headers, method="POST",
+    )
+    urllib.request.urlopen(req, timeout=15).read()
+
+
+def send_pick(pick, n_today):
     lines = [pick["title"]]
     for name, cost, avg, rel in pick["holders"]:
         lines.append(f"• {name}: ${cost:,.0f} @ {cents(avg)} ({rel:.1f}x their usual)")
@@ -221,33 +296,33 @@ def send(pick, n_today):
         lines.append(f"Pick {n_today} of {MAX_ALERTS_PER_DAY} today")
     else:
         lines.append(f"Pick #{n_today} today")
-    body = "\n".join(lines)
+    notify(f"{pick['n']} traders agree: {pick['outcome']}", "\n".join(lines),
+           "handshake,moneybag", pick["event_slug"])
 
-    if DRY_RUN or not NTFY_TOPIC:
-        print(f"--- {title}\n{body}\n")
-        return
 
-    headers = {
-        "Title": title.encode("latin-1", "ignore").decode("latin-1"),
-        "Tags": "handshake,moneybag",
-        "Priority": "high",
-    }
-    if pick["event_slug"]:
-        headers["Click"] = f"https://polymarket.com/event/{pick['event_slug']}"
-    req = urllib.request.Request(
-        f"{NTFY_SERVER}/{NTFY_TOPIC}", data=body.encode("utf-8"),
-        headers=headers, method="POST",
-    )
-    urllib.request.urlopen(req, timeout=15).read()
+def send_warning(info, against):
+    lines = [info["title"], f"You were alerted on: {info['outcome']}", "Now on the other side:"]
+    for name, outcome, market, cost in sorted(against, key=lambda h: -h[3]):
+        lines.append(f"• {name}: ${cost:,.0f} on {outcome} ({market})")
+    notify(f"WARNING: other side taken on {info['outcome']}", "\n".join(lines),
+           "warning", info.get("event_slug", ""))
 
 
 # ------------------------------------------------------------------ state --
 def load_state():
     try:
         with open(STATE_FILE) as f:
-            return json.load(f)
+            state = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"day": "", "sent_today": 0, "alerted": {}}
+        state = {}
+    state.setdefault("day", "")
+    state.setdefault("sent_today", 0)
+    # older versions stored just a date string per alert
+    state["alerted"] = {
+        k: (v if isinstance(v, dict) else {"day": v})
+        for k, v in state.get("alerted", {}).items()
+    }
+    return state
 
 
 def save_state(state):
@@ -259,10 +334,10 @@ def save_state(state):
 def main():
     today = datetime.now(ZoneInfo(TIMEZONE)).date()
     state = load_state()
-    if state.get("day") != today.isoformat():
+    if state["day"] != today.isoformat():
         state["day"], state["sent_today"] = today.isoformat(), 0
-    cutoff = (today - timedelta(days=7)).isoformat()
-    state["alerted"] = {k: d for k, d in state.get("alerted", {}).items() if d >= cutoff}
+    cutoff = (today - timedelta(days=REMEMBER_DAYS)).isoformat()
+    state["alerted"] = {k: v for k, v in state["alerted"].items() if v.get("day", "") >= cutoff}
 
     all_positions = {}
     for name, wallet in get_traders().items():
@@ -273,7 +348,14 @@ def main():
             print(f"! couldn't fetch {name}: {e}", file=sys.stderr)
         time.sleep(0.3)
 
-    picks = [p for p in find_consensus(all_positions) if p["key"] not in state["alerted"]]
+    picks, idx = find_consensus(all_positions)
+
+    # 1) follow-up warnings on bets you were already alerted on
+    for key, info, against in find_warnings(state, idx):
+        send_warning(info, against)
+        info["warned"] = True
+    # 2) new consensus plays
+    picks = [p for p in picks if p["key"] not in state["alerted"]]
     if MAX_ALERTS_PER_DAY:
         room = max(MAX_ALERTS_PER_DAY - state["sent_today"], 0)
     else:
@@ -281,9 +363,13 @@ def main():
     print(f"{len(picks)} new consensus plays, sending {min(room, len(picks))}")
 
     for pick in picks[:room]:
-        send(pick, state["sent_today"] + 1)
-        state["alerted"][pick["key"]] = today.isoformat()
+        send_pick(pick, state["sent_today"] + 1)
         state["sent_today"] += 1
+        state["alerted"][pick["key"]] = {
+            "day": today.isoformat(), "game": pick["game"], "axis": pick["axis"],
+            "dir": pick["dir"], "title": pick["title"], "outcome": pick["outcome"],
+            "event_slug": pick["event_slug"], "warned": False,
+        }
 
     save_state(state)
 
