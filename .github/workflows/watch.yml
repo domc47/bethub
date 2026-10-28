@@ -26,10 +26,12 @@ jobs:
       - name: Check for new bets
         run: python3 watch.py
         env:
-          PM_USERNAME: homerunhazard
-          PM_WALLET: ${{ vars.PM_WALLET }}
+          PM_USERNAMES: homerunhazard
+          LEADERBOARD_TOP: "10"
+          LEADERBOARD_PERIOD: "MONTH"
+          LEADERBOARD_ORDER: "PNL"
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          MIN_USD: "1000"
+          MIN_USD: "5000"
           BUYS_ONLY: "true"
 
       - name: Save state
@@ -38,4 +40,3 @@ jobs:
         with:
           path: state.json
           key: pm-state-${{ github.run_id }}
-
