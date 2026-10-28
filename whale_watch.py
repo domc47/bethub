@@ -16,6 +16,8 @@ import time
 import urllib.parse
 import urllib.request
 
+import tracker  # paper-trading ledger (tracker.py)
+
 
 def env(name, default, cast=str):
     v = os.environ.get(name, "")
@@ -247,15 +249,18 @@ def process_pending(wallet, rows, bets, state, now):
         if MAX_UNITS:
             units = min(units, MAX_UNITS)
         p["stake"] = max(UNIT_USD, round(UNIT_USD * units))
+        _, fee, _ = tracker.buy_with_fee(p["stake"], now_price, p["conditionId"])
 
         notify(f"#{p['rank']} {p['name']}: {p['outcome']} - bet ${p['stake']:,.0f}",
                f"{p['title']}\n"
                f"They bet ${p['usd']:,.0f} ({p['usd'] / p['avg']:.1f}x their ${p['avg']:,.0f} avg)\n"
                f"They paid {cents(p['price'])}, now {cents(now_price)} ({move:+.1%})\n"
-               f"Your stake: ${p['stake']:,.0f} ({p['stake'] / UNIT_USD:g} units)"
+               f"Your stake: ${p['stake']:,.0f} ({p['stake'] / UNIT_USD:g} units), "
+               f"fee ~${fee:,.2f} ({fee / p['stake']:.1%})"
                + (f"\n{p['stat']}" if p.get("stat") else ""),
                ["whale"], priority=4, click=link(p["eventSlug"]))
         add_watch(p, state)
+        tracker.record_entry(p, now_price, now)
     state["pending"] = remaining
 
 
@@ -317,6 +322,7 @@ def check_followups(wallet, new_rows, state, now):
             w["sold_shares"] += sold_sh
             frac = min(1.0, w["sold_shares"] / w["shares"]) if w["shares"] else 1.0
             verb = "EXITED" if frac >= 0.95 else f"SOLD {frac:.0%} of"
+            tracker.record_exit(wallet, w["asset"], 1.0 if frac >= 0.95 else frac, now)
             notify(f"{verb}: {w['name']} on {w['outcome']}",
                    f"{head}\nSold ${sold_usd:,.0f} @ {cents(sold_usd / sold_sh)}",
                    ["chart_with_downwards_trend"], priority=4, click=url)
@@ -386,6 +392,8 @@ def main():
         check_followups(wallet, new_rows, state, now)
         new_cursor[wallet] = max(cursor, latest)
 
+    tracker.settle(state, now)
+    tracker.save()
     state["cursor"] = new_cursor  # wallets no longer tracked are dropped, so no stale catch-up later
     state["handled"] = {k: t for k, t in state["handled"].items() if now - t < 14 * 86400}
     with open(STATE_FILE, "w") as f:
