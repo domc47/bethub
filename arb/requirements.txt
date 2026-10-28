@@ -1,0 +1,2 @@
+requests>=2.31,<3
+polymarket-us>=2.1,<3
