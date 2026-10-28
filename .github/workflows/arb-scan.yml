@@ -1,0 +1,52 @@
+name: arb-scan
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 min (GitHub often runs these late)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "scan or discover"
+        type: choice
+        options: [scan, discover]
+        default: scan
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+
+      - name: Restore alert memory
+        uses: actions/cache/restore@v4
+        with:
+          path: arb/state
+          key: arb-state-${{ github.run_id }}
+          restore-keys: arb-state-
+
+      - name: Run
+        run: python arb_scanner.py ${{ inputs.mode || 'scan' }}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          MIN_EDGE: "0.02"
+
+      - name: Save alert memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: arb/state
+          key: arb-state-${{ github.run_id }}
+
+      - name: Upload candidates
+        if: ${{ inputs.mode == 'discover' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidates
+          path: arb/candidates.csv
