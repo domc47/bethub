@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
 Polymarket bet watcher.
-Polls a trader's public activity and pushes a phone notification (via ntfy)
-whenever they place a new bet. Standard library only, no installs needed.
+Polls one or more traders' public activity and pushes a phone notification
+(via ntfy) whenever they place a new bet. Standard library only.
 
   python watch.py            # check once (used by GitHub Actions)
-  python watch.py --loop     # keep running, check every 30s (run on your own machine)
+  python watch.py --loop     # keep running, check every 30s (your own machine)
+
+PM_USERNAMES is a comma-separated list, e.g. "homerunhazard,someoneelse".
+If a username lookup ever fails, use "name=0xWALLET" for that entry.
+LEADERBOARD_TOP=10 also follows the current top 10 on the leaderboard,
+refreshed every check, so people who climb onto it get added automatically.
 """
 import argparse
 import json
@@ -17,20 +22,34 @@ import urllib.request
 from collections import defaultdict
 
 # ---- Settings (override with environment variables) -------------------------
-USERNAME    = os.getenv("PM_USERNAME", "homerunhazard")
-WALLET      = os.getenv("PM_WALLET", "").strip()          # optional: skip username lookup
-NTFY_TOPIC  = os.getenv("NTFY_TOPIC", "").strip()          # your private ntfy topic name
+RAW_USERS   = os.getenv("PM_USERNAMES", os.getenv("PM_USERNAME", "homerunhazard"))
+NTFY_TOPIC  = os.getenv("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-MIN_USD     = float(os.getenv("MIN_USD", "1000"))          # ignore bets smaller than this
+MIN_USD     = float(os.getenv("MIN_USD", "1000"))
 BUYS_ONLY   = os.getenv("BUYS_ONLY", "true").lower() == "true"
 STATE_FILE  = os.getenv("STATE_FILE", "state.json")
+LB_TOP      = int(os.getenv("LEADERBOARD_TOP", "0") or 0)     # 0 = off
+LB_PERIOD   = os.getenv("LEADERBOARD_PERIOD", "MONTH").upper() # DAY, WEEK, MONTH, ALL
+LB_CATEGORY = os.getenv("LEADERBOARD_CATEGORY", "OVERALL").upper()
+LB_ORDER    = os.getenv("LEADERBOARD_ORDER", "PNL").upper()    # PNL or VOL
 # -----------------------------------------------------------------------------
 
 DATA_API  = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
-HEADERS   = {"User-Agent": "pm-bet-watcher/1.0", "Accept": "application/json"}
+HEADERS   = {"User-Agent": "pm-bet-watcher/1.1", "Accept": "application/json"}
 PAGE      = 500
-MAX_PAGES = 6  # up to 3,000 fills per check
+MAX_PAGES = 6
+
+
+def parse_users(raw):
+    users = {}
+    for part in raw.split(","):
+        part = part.strip().lstrip("@")
+        if not part:
+            continue
+        name, _, wallet = part.partition("=")
+        users[name.strip()] = wallet.strip() or None
+    return users
 
 
 def get_json(url, params=None):
@@ -41,8 +60,24 @@ def get_json(url, params=None):
         return json.load(r)
 
 
+def fetch_leaderboard():
+    """Current top traders as {display_name: wallet}."""
+    rows = get_json(f"{DATA_API}/v1/leaderboard", {
+        "category": LB_CATEGORY, "timePeriod": LB_PERIOD,
+        "orderBy": LB_ORDER, "limit": LB_TOP,
+    })
+    if isinstance(rows, dict):
+        rows = rows.get("data") or rows.get("leaderboard") or []
+    top = {}
+    for r in rows[:LB_TOP]:
+        wallet = r.get("proxyWallet")
+        if wallet:
+            name = r.get("userName") or r.get("name") or wallet[:10]
+            top[name] = wallet
+    return top
+
+
 def resolve_wallet(username):
-    """Turn a Polymarket @username into its proxy wallet address."""
     data = get_json(f"{GAMMA_API}/public-search",
                     {"q": username, "search_profiles": "true"})
     profiles = data.get("profiles") or []
@@ -51,16 +86,18 @@ def resolve_wallet(username):
         if username.lower() in names and p.get("proxyWallet"):
             return p["proxyWallet"]
     found = ", ".join(f'{p.get("name")} ({p.get("proxyWallet")})' for p in profiles[:5])
-    sys.exit(f"Couldn't find @{username}. Candidates: {found or 'none'}. "
-             "Set PM_WALLET to the 0x address shown on their profile instead.")
+    raise RuntimeError(f"Couldn't find @{username}. Candidates: {found or 'none'}. "
+                       f"Use {username}=0xWALLET in PM_USERNAMES instead.")
 
 
 def load_state():
     try:
         with open(STATE_FILE) as f:
-            return json.load(f)
+            state = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        state = {}
+    state.setdefault("users", {})
+    return state
 
 
 def save_state(state):
@@ -73,7 +110,6 @@ def fill_key(t):
 
 
 def fetch_new_fills(wallet, last_ts, seen):
-    """Newest-first fills that happened after the last one we processed."""
     new = []
     for page in range(MAX_PAGES):
         batch = get_json(f"{DATA_API}/activity", {
@@ -96,7 +132,6 @@ def fetch_new_fills(wallet, last_ts, seen):
 
 
 def group_bets(fills):
-    """One bet is often many fills; merge them by market + outcome + side."""
     groups = defaultdict(lambda: {"usd": 0.0, "shares": 0.0, "ts": 0})
     for t in fills:
         k = (t.get("title") or "Unknown market", t.get("outcome") or "?",
@@ -138,43 +173,77 @@ def describe(b):
     return f'{verb} ${b["usd"]:,.0f} of {b["outcome"]} @ {b["avg"]*100:.1f}¢ — {b["title"]}'
 
 
-def check_once(state):
-    if not state.get("wallet"):
-        state["wallet"] = WALLET or resolve_wallet(USERNAME)
-        print(f"Watching @{USERNAME} → {state['wallet']}")
-    wallet = state["wallet"]
-    last_ts, seen = int(state.get("last_ts", 0)), set(state.get("seen", []))
+def check_user(username, wallet_override, us, quiet_start=False):
+    if not us.get("wallet"):
+        us["wallet"] = wallet_override or resolve_wallet(username)
+        print(f"Watching @{username} → {us['wallet']}")
+    last_ts, seen = int(us.get("last_ts", 0)), set(us.get("seen", []))
 
-    fills = fetch_new_fills(wallet, last_ts, seen)
-    first_run = "last_ts" not in state
+    fills = fetch_new_fills(us["wallet"], last_ts, seen)
+    first_run = "last_ts" not in us
 
     if fills:
         newest = max(int(t.get("timestamp") or 0) for t in fills)
         at_newest = {fill_key(t) for t in fills if int(t.get("timestamp") or 0) == newest}
-        state["last_ts"] = newest
-        state["seen"] = sorted(at_newest | (seen if newest == last_ts else set()))
+        us["last_ts"] = newest
+        us["seen"] = sorted(at_newest | (seen if newest == last_ts else set()))
     elif first_run:
-        state["last_ts"] = int(time.time())
-        state["seen"] = []
+        us["last_ts"] = int(time.time())
+        us["seen"] = []
 
     if first_run:
-        notify(f"Watching @{USERNAME}", "Watcher is live. You'll get a ping on new bets.")
-        return  # don't flood you with their history on the first run
+        if quiet_start:
+            print(f"Now following @{username} from the leaderboard")
+        else:
+            notify(f"Watching @{username}", "Watcher is live. You'll get a ping on new bets.")
+        return
 
     bets = group_bets(fills)
-    print(f"{time.strftime('%H:%M:%S')} {len(fills)} new fills, {len(bets)} bets to report")
+    print(f"{time.strftime('%H:%M:%S')} @{username}: {len(fills)} new fills, {len(bets)} bets")
     if not bets:
         return
     if len(bets) == 1:
         b = bets[0]
-        notify(f"@{USERNAME} placed a bet", describe(b),
+        notify(f"@{username} placed a bet", describe(b),
                click=f'https://polymarket.com/event/{b["slug"]}' if b["slug"] else None)
     else:
         lines = [describe(b) for b in bets[:8]]
         if len(bets) > 8:
             lines.append(f"…and {len(bets) - 8} more")
-        notify(f"@{USERNAME} placed {len(bets)} bets", "\n".join(lines),
-               click=f"https://polymarket.com/@{USERNAME}")
+        profile = (f"https://polymarket.com/profile/{us['wallet']}" if username.startswith("0x")
+                   else f"https://polymarket.com/@{username}")
+        notify(f"@{username} placed {len(bets)} bets", "\n".join(lines), click=profile)
+
+
+def check_all(state, users):
+    targets = {name: (wallet, False) for name, wallet in users.items()}
+    if LB_TOP > 0:
+        try:
+            top = fetch_leaderboard()
+            if not state.get("lb_armed"):
+                notify(f"Following the top {LB_TOP}",
+                       f"{LB_PERIOD.title()} {LB_ORDER} leaderboard: " + ", ".join(top))
+                state["lb_armed"] = True
+            have = {n.lower() for n in targets}
+            for name, wallet in top.items():
+                if name.lower() not in have:
+                    targets[name] = (wallet, True)
+        except Exception as e:
+            print(f"Leaderboard fetch failed: {e}", file=sys.stderr)
+
+    failures = 0
+    for name, (wallet, from_lb) in targets.items():
+        us = state["users"].setdefault(name.lower(), {})
+        try:
+            check_user(name, wallet, us, quiet_start=from_lb)
+        except Exception as e:
+            failures += 1
+            print(f"@{name}: check failed: {e}", file=sys.stderr)
+
+    # forget traders we're no longer following, so the state file stays small
+    keep = {n.lower() for n in targets}
+    state["users"] = {k: v for k, v in state["users"].items() if k in keep}
+    return failures, len(targets)
 
 
 def main():
@@ -183,18 +252,13 @@ def main():
     ap.add_argument("--interval", type=int, default=30, help="seconds between checks")
     args = ap.parse_args()
 
+    users = parse_users(RAW_USERS)
     state = load_state()
     while True:
-        try:
-            check_once(state)
-            save_state(state)
-        except Exception as e:
-            print(f"Check failed: {e}", file=sys.stderr)
-            if not args.loop:
-                save_state(state)
-                sys.exit(1)
+        failures, total = check_all(state, users)
+        save_state(state)
         if not args.loop:
-            break
+            sys.exit(1 if total == 0 or failures == total else 0)
         time.sleep(args.interval)
 
 
