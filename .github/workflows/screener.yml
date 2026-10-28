@@ -1,0 +1,44 @@
+name: screener
+
+on:
+  schedule:
+    - cron: "0 12 * * 1"   # Mondays 12:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: screener
+  cancel-in-progress: false
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Paper-trading report
+        run: python tracker.py
+        continue-on-error: true
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+      - name: Score traders
+        run: python screener.py
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}        # rename to match your existing secret
+          EXTRA_WALLETS: ${{ vars.EXTRA_WALLETS }}
+
+      - name: Commit watchlist
+        run: |
+          git config user.name "screener-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          [ -f watchlist.json ] || exit 0
+          git add watchlist.json
+          git diff --cached --quiet || (git commit -m "Update watchlist" && git pull --rebase && git push)
