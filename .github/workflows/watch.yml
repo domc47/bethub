@@ -30,4 +30,12 @@ jobs:
           PM_WALLET: ${{ vars.PM_WALLET }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           MIN_USD: "1000"
-          BUYS_ONLY
+          BUYS_ONLY: "true"
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: pm-state-${{ github.run_id }}
+
