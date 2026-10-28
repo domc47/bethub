@@ -1,0 +1,33 @@
+name: Polymarket bet watcher
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: pm-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore last-seen state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: pm-state-${{ github.run_id }}
+          restore-keys: pm-state-
+
+      - name: Check for new bets
+        run: python3 watch.py
+        env:
+          PM_USERNAME: homerunhazard
+          PM_WALLET: ${{ vars.PM_WALLET }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          MIN_USD: "1000"
+          BUYS_ONLY
