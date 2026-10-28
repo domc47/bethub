@@ -1,0 +1,46 @@
+name: whale-watch
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"  # every 15 min; GitHub often starts runs 5-20 min late
+  workflow_dispatch:
+
+concurrency:
+  group: whale-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # State is kept in the Actions cache so the repo doesn't get a commit every run
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: whale_state.json
+          key: whale-state-${{ github.run_id }}
+          restore-keys: whale-state-
+
+      - name: Run watcher
+        run: python whale_watch.py
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}        # rename to match your existing secret
+          EXTRA_WALLETS: ${{ vars.EXTRA_WALLETS }}     # optional: comma-separated 0x addresses
+          # AVG_MULTIPLIER: "1.5"                      # uncomment to tighten alerts
+          # CONFIRM_DELAY_MIN: "15"                    # uncomment to wait before alerting
+          # MAX_UNITS: "5"                             # uncomment to cap stakes at 5 units ($50)
+          # MAX_PRICE_MOVE_PCT: "3"                    # uncomment to loosen the 2% price filter
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: whale_state.json
+          key: whale-state-${{ github.run_id }}-${{ github.run_attempt }}
