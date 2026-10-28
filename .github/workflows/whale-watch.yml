@@ -5,6 +5,9 @@ on:
     - cron: "*/15 * * * *"  # every 15 min; GitHub often starts runs 5-20 min late
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 concurrency:
   group: whale-watch
   cancel-in-progress: false
@@ -44,3 +47,14 @@ jobs:
         with:
           path: whale_state.json
           key: whale-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # The paper-trading ledger is committed so its history is never lost
+      - name: Commit ledger
+        run: |
+          [ -f ledger.csv ] || exit 0
+          git config user.name "whale-watch-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ledger.csv
+          git diff --cached --quiet && exit 0
+          git commit -m "Update paper-trading ledger"
+          git pull --rebase && git push
