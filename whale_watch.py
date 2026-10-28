@@ -29,6 +29,7 @@ NTFY_TOKEN = env("NTFY_TOKEN", "")             # only if your topic is access-pr
 STATE_FILE = env("STATE_FILE", "whale_state.json")
 
 # ---- Who to watch ----
+WATCHLIST_FILE = env("WATCHLIST_FILE", "watchlist.json")  # from screener.py; falls back to leaderboard
 TOP_N = env("TOP_N", 10, int)
 LB_PERIOD = env("LB_PERIOD", "MONTH")          # DAY | WEEK | MONTH | ALL
 LB_ORDER = env("LB_ORDER", "PNL")              # PNL | VOL
@@ -47,7 +48,7 @@ STALE_MIN = env("STALE_MIN", 180, int)         # never alert on a bet older than
 # ---- Your sizing and price protection ----
 UNIT_USD = env("UNIT_USD", 10, float)          # your 1-unit stake; alerts scale it by their bet / their avg
 MAX_UNITS = env("MAX_UNITS", 0, float)         # cap on units per alert (0 = no cap)
-MAX_PRICE_MOVE_PCT = env("MAX_PRICE_MOVE_PCT", 2.0, float)  # skip if current price is >2% worse than theirs
+MAX_PRICE_MOVE_PCT = env("MAX_PRICE_MOVE_PCT", 3.0, float)  # skip if current price is >3% worse than theirs
 
 # ---- Both-sides and hedge logic ----
 BOTH_SIDES_WINDOW_MIN = env("BOTH_SIDES_WINDOW_MIN", 60, int)  # other side bought this close = both sides
@@ -76,6 +77,15 @@ def get(path, base=API, **params):
 
 
 def top_traders():
+    """Screened watchlist if there is one, otherwise the raw leaderboard top N."""
+    try:
+        with open(WATCHLIST_FILE) as f:
+            wl = json.load(f).get("wallets", [])
+        if wl:
+            return {w["wallet"].lower(): {"rank": str(i), "name": w["name"], "stat": w.get("stat", "")}
+                    for i, w in enumerate(wl, 1)}
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
     rows = get("/v1/leaderboard", category=LB_CATEGORY, timePeriod=LB_PERIOD,
                orderBy=LB_ORDER, limit=TOP_N)
     return {r["proxyWallet"].lower(): {"rank": str(r.get("rank", "?")),
@@ -192,7 +202,8 @@ def find_big_bets(wallet, who, bets, cursor, state, now):
         if now - b["last_ts"] > STALE_MIN * 60:
             print(f"  skip stale bet: {b['title']}")
             continue
-        state["pending"].append(dict(b, name=who["name"], rank=who["rank"], avg=avg, detected=now))
+        state["pending"].append(dict(b, name=who["name"], rank=who["rank"], avg=avg, detected=now,
+                                       stat=who.get("stat", "")))
 
 
 def process_pending(wallet, rows, bets, state, now):
@@ -241,7 +252,8 @@ def process_pending(wallet, rows, bets, state, now):
                f"{p['title']}\n"
                f"They bet ${p['usd']:,.0f} ({p['usd'] / p['avg']:.1f}x their ${p['avg']:,.0f} avg)\n"
                f"They paid {cents(p['price'])}, now {cents(now_price)} ({move:+.1%})\n"
-               f"Your stake: ${p['stake']:,.0f} ({p['stake'] / UNIT_USD:g} units)",
+               f"Your stake: ${p['stake']:,.0f} ({p['stake'] / UNIT_USD:g} units)"
+               + (f"\n{p['stat']}" if p.get("stat") else ""),
                ["whale"], priority=4, click=link(p["eventSlug"]))
         add_watch(p, state)
     state["pending"] = remaining
@@ -382,4 +394,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
