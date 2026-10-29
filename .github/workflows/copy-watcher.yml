@@ -5,6 +5,9 @@ on:
     - cron: "*/15 * * * *"   # every 15 minutes (GitHub may run it a few minutes late)
   workflow_dispatch:
 
+permissions:
+  contents: write            # to save new bets to copy_ledger.csv
+
 concurrency:
   group: copy-watcher
   cancel-in-progress: false
@@ -41,3 +44,12 @@ jobs:
         with:
           path: watcher_state.json
           key: watcher-state-${{ github.run_id }}
+
+      - name: Save new bets to the ledger
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f copy_ledger.csv ]; then git add copy_ledger.csv; fi
+          git diff --cached --quiet && exit 0
+          git commit -m "Log copied bets"
+          for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
