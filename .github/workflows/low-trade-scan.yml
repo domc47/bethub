@@ -6,7 +6,7 @@ on:
   workflow_dispatch:        # adds a "Run workflow" button in the Actions tab
 
 permissions:
-  contents: write           # lets the job commit results back to the repo
+  contents: write           # lets the job save results back to the repo
 
 jobs:
   scan:
@@ -20,15 +20,17 @@ jobs:
           python-version: "3.12"
 
       - name: Run scan
-        run: python low_trade_leaders.py --top 100 --max-trades 500 --days 30
+        run: python low_trade_leaders.py --top 100 --max-trades 500 --days 30 --min-roi 0
 
       - name: Commit results
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add low_trade_leaders.json low_trade_leaders.csv
-          git diff --cached --quiet || git commit -m "Update low-trade leaderboard scan"
-          git push
+          git add low_trade_leaders.json
+          if [ -f low_trade_leaders.csv ]; then git add low_trade_leaders.csv; fi
+          git diff --cached --quiet && exit 0
+          git commit -m "Update low-trade leaderboard scan"
+          for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
 
       - name: Upload results
         uses: actions/upload-artifact@v4
