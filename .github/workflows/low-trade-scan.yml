@@ -1,0 +1,37 @@
+name: Low-trade leaderboard scan
+
+on:
+  schedule:
+    - cron: "0 13 * * 1"   # Mondays 13:00 UTC (8am Central)
+  workflow_dispatch:        # adds a "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write           # lets the job commit results back to the repo
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run scan
+        run: python low_trade_leaders.py --top 100 --max-trades 500 --days 30
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add low_trade_leaders.json low_trade_leaders.csv
+          git diff --cached --quiet || git commit -m "Update low-trade leaderboard scan"
+          git push
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: low-trade-leaders
+          path: low_trade_leaders.*
