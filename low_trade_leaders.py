@@ -69,9 +69,14 @@ def fetch_leaderboard(top, period, category, order):
     return out[:top]
 
 
-def count_trades(wallet, since_ts, cap):
-    """Count TRADE rows since since_ts, stopping early once we hit cap."""
-    total, offset = 0, 0
+def count_trades(wallet, since_ts, cap, return_rows=False):
+    """Count TRADE rows since since_ts, stopping early once we hit cap.
+
+    Keeps paging until the API returns nothing or we reach trades older than
+    the window, so a server that returns smaller pages than requested can't
+    cause an undercount.
+    """
+    total, offset, kept = 0, 0, []
     while total < cap:
         rows = get("/activity", {
             "user": wallet, "type": "TRADE", "start": since_ts,
@@ -80,11 +85,30 @@ def count_trades(wallet, since_ts, cap):
         })
         if not rows:
             break
-        total += len(rows)
-        if len(rows) < ACTIVITY_PAGE:
+        in_window = [r for r in rows if int(r.get("timestamp") or 0) >= since_ts]
+        total += len(in_window)
+        if return_rows:
+            kept.extend(in_window)
+        if len(in_window) < len(rows):  # reached trades older than the window
             break
         offset += len(rows)
-    return total
+        if offset >= 5000:  # API offset cap
+            break
+    return (total, kept) if return_rows else total
+
+
+def check_wallet(wallet, days, cap):
+    """Debug one wallet: show the count and the date range it covers."""
+    since = int(time.time()) - days * 86400
+    n, rows = count_trades(wallet, since, cap, return_rows=True)
+    fmt = lambda ts: time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(ts)))
+    print(f"Wallet {wallet}")
+    print(f"Trades in last {days} days: {n if n < cap else str(cap) + '+'}")
+    if rows:
+        ts = [int(r.get("timestamp") or 0) for r in rows]
+        print(f"Newest counted: {fmt(max(ts))} UTC")
+        print(f"Oldest counted: {fmt(min(ts))} UTC")
+        print(f"Window starts:  {fmt(since)} UTC")
 
 
 def main():
@@ -98,7 +122,12 @@ def main():
     p.add_argument("--days", type=int, default=30, help="look-back window for counting trades")
     p.add_argument("--out", default="low_trade_leaders", help="output file prefix (.json and .csv written)")
     p.add_argument("--sleep", type=float, default=0.25, help="pause between traders to be polite to the API")
+    p.add_argument("--wallet", help="check a single wallet address instead of scanning the leaderboard")
     a = p.parse_args()
+
+    if a.wallet:
+        check_wallet(a.wallet, a.days, a.max_trades)
+        return
 
     since = int(time.time()) - a.days * 86400
     print(f"Pulling top {a.top} {a.category} traders by {a.order} ({a.period})...", file=sys.stderr)
