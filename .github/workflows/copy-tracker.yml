@@ -1,0 +1,49 @@
+name: Copy-trade Excel tracker
+
+on:
+  schedule:
+    - cron: "5 */3 * * *"    # every 3 hours, refreshes prices and results
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: copy-tracker
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          pip install openpyxl
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libreoffice-calc
+
+      - name: Build tracker
+        run: python build_ledger.py --unit 10 --fee-rate 0.06
+
+      # Fills in the formula results so the file previews correctly on a phone
+      - name: Calculate formulas
+        run: |
+          mkdir -p calc
+          soffice --headless --calc --convert-to xlsx:"Calc MS Excel 2007 XML" --outdir calc copy_tracker.xlsx
+          mv calc/copy_tracker.xlsx copy_tracker.xlsx
+
+      - name: Commit tracker
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add copy_tracker.xlsx
+          git diff --cached --quiet && exit 0
+          git commit -m "Update copy-trade tracker"
+          for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
