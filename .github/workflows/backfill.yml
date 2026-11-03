@@ -33,7 +33,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add copy_ledger.csv
+          if [ -f copy_ledger.csv ]; then git add copy_ledger.csv; fi
           git diff --cached --quiet && exit 0
           git commit -m "Backfill past copied bets"
           for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
