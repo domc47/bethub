@@ -18,6 +18,8 @@ in my_fills.csv as: 12,0.47,9.80
 Converts, merges and splits are ignored. Fills from the same order are
 combined into one alert.
 
+Uses Polymarket Data API v2 (v1 was retired on Nov 2, 2026 and answers 410).
+
 Env vars:
   NTFY_TOPIC   (required) your ntfy topic
   NTFY_SERVER  (optional) default https://ntfy.sh
@@ -31,10 +33,12 @@ import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-from low_trade_leaders import get, fetch_markets
+from low_trade_leaders import fetch_markets
 
 STATE_FILE = "watcher_state.json"
 LEDGER_FILE = "copy_ledger.csv"
@@ -67,18 +71,46 @@ def load_json(path, default):
         return default
 
 
-def new_trades(wallet, since_ts, seen):
-    rows, offset = [], 0
-    while True:
-        batch = get("/activity", {
-            "user": wallet, "type": "TRADE", "start": since_ts,
-            "limit": 500, "offset": offset,
-            "sortBy": "TIMESTAMP", "sortDirection": "DESC",
-        }) or []
-        rows += [r for r in batch if int(r.get("timestamp") or 0) >= since_ts]
-        if len(batch) < 500 or offset >= 4500:
+DATA_API = "https://data-api.polymarket.com/v2"
+
+
+def get_v2(path, params, tries=4):
+    """GET a Polymarket Data API v2 route (v1 was retired Nov 2, 2026)."""
+    q = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    req = urllib.request.Request(f"{DATA_API}{path}?{q}", headers={"User-Agent": "bethub/1.0"})
+    for i in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 503) and i < tries - 1:
+                time.sleep(int(e.headers.get("Retry-After") or 2 ** i))
+                continue
+            raise
+
+
+def v1_shape(r):
+    """Give a v2 activity row the field names the rest of this code uses."""
+    r["asset"] = r.get("token_id")
+    r["conditionId"] = r.get("condition_id")
+    r["transactionHash"] = r.get("transaction_hash")
+    r["eventSlug"] = r.get("event_slug")
+    r["outcomeIndex"] = r.get("outcome_index")
+    return r
+
+
+def new_trades(wallet, since_ts, seen, max_pages=20):
+    rows, cursor = [], None
+    for _ in range(max_pages):
+        page = get_v2("/activity", {
+            "user": wallet, "type": "TRADE", "start": since_ts, "limit": 500,
+            "sort_by": "TIMESTAMP", "sort_direction": "DESC", "cursor": cursor,
+        }) or {}
+        rows += [v1_shape(r) for r in page.get("data") or []
+                 if int(r.get("timestamp") or 0) >= since_ts]
+        cursor = (page.get("pagination") or {}).get("next_cursor")
+        if not cursor:
             break
-        offset += 500
     out = []
     for r in rows:
         key = f'{r.get("transactionHash")}:{r.get("asset")}:{r.get("side")}:{r.get("size")}'
@@ -108,9 +140,10 @@ def group_fills(rows):
 
 def remaining_shares(wallet, condition_id, asset):
     try:
-        for p in get("/positions", {"user": wallet, "market": condition_id, "sizeThreshold": 0}) or []:
-            if str(p.get("asset")) == str(asset):
-                return float(p.get("size") or 0)
+        page = get_v2("/positions", {"user": wallet, "condition": condition_id, "limit": 100}) or {}
+        for p in page.get("data") or []:
+            if str(p.get("token_id")) == str(asset):
+                return float(p.get("current_size") or 0)
         return 0.0
     except Exception:
         return None
