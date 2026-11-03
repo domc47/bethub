@@ -39,6 +39,7 @@ jobs:
           soffice --headless --calc --convert-to xlsx:"Calc MS Excel 2007 XML" --outdir calc copy_tracker.xlsx
           mv calc/copy_tracker.xlsx copy_tracker.xlsx
 
+      # The tracker is rebuilt from scratch each run, so this run's copy always wins
       - name: Commit tracker
         run: |
           git config user.name "github-actions[bot]"
@@ -46,4 +47,10 @@ jobs:
           git add copy_tracker.xlsx
           git diff --cached --quiet && exit 0
           git commit -m "Update copy-trade tracker"
-          for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
+          for i in 1 2 3; do
+            git pull --rebase -X theirs && git push && exit 0
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+          echo "Could not push the tracker"
+          exit 1
