@@ -23,12 +23,19 @@ These add up to your true P&L per position.
 Fees use Polymarket's taker formula: fee = rate x shares x price x (1 - price),
 charged on buys and sells (not on payouts). Default rate 0.06 = Polymarket US.
 
+Current prices come from Polymarket's Gamma market API. If that lookup fails,
+the tracker is still built, using the last traded price in the ledger.
+
 Needs: pip install openpyxl
 """
 
 import argparse
 import csv
+import json
+import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 
 from openpyxl import Workbook
@@ -36,8 +43,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from low_trade_leaders import fetch_markets
-
+GAMMA = "https://gamma-api.polymarket.com/markets"
 FONT = "Arial"
 HDR_FILL = PatternFill("solid", start_color="1F3864")
 INPUT_FILL = PatternFill("solid", start_color="FFFF00")
@@ -48,6 +54,57 @@ PRICE = '$0.000'
 PCT = '0.0%;(0.0%);"-"'
 SHARES = '#,##0.00;(#,##0.00);"-"'
 
+
+# ---------- prices ----------
+
+def _gamma(params):
+    url = f"{GAMMA}?{urllib.parse.urlencode(params, doseq=True)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "bethub/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp)
+
+
+def _as_list(v):
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            return []
+    return list(v or [])
+
+
+def fetch_markets(condition_ids):
+    """{condition_id: {"prices": [...], "tokens": [...], "closed": bool}} from Gamma.
+    Markets it can't find (e.g. parlays) are simply missing."""
+    ids = sorted({c for c in condition_ids if c})
+    out = {}
+    for i in range(0, len(ids), 20):
+        chunk = ids[i:i + 20]
+        for extra in ({}, {"closed": "true"}):  # open first, then closed ones not yet found
+            todo = [c for c in chunk if c not in out]
+            if not todo:
+                break
+            try:
+                rows = _gamma({"condition_ids": todo, "limit": 100, **extra}) or []
+            except Exception as e:
+                print(f"price lookup failed: {e}", file=sys.stderr)
+                continue
+            for m in rows:
+                cid = m.get("conditionId")
+                if cid not in todo:
+                    continue
+                try:
+                    prices = [float(p) for p in _as_list(m.get("outcomePrices"))]
+                except ValueError:
+                    prices = []
+                out[cid] = {"prices": prices,
+                            "tokens": [str(t) for t in _as_list(m.get("clobTokenIds"))],
+                            "closed": bool(m.get("closed"))}
+            time.sleep(0.2)
+    return out
+
+
+# ---------- sheet helpers ----------
 
 def style_header(ws, row, ncols):
     for c in range(1, ncols + 1):
@@ -74,7 +131,7 @@ def widths(ws, w):
 
 def market_status(cid, outcome_idx, markets):
     m = markets.get(cid)
-    if not m or not m["prices"]:
+    if not m or not m["prices"] or outcome_idx is None:
         return None, "No price"
     try:
         price = m["prices"][outcome_idx]
@@ -134,7 +191,11 @@ def main():
     bets.sort(key=lambda r: int(r["timestamp"] or 0))
     fills = read_fills(a.fills)
 
-    markets = fetch_markets([b["condition_id"] for b in bets]) if bets else {}
+    try:
+        markets = fetch_markets([b["condition_id"] for b in bets]) if bets else {}
+    except Exception as e:
+        print(f"price lookup failed, using last traded prices: {e}", file=sys.stderr)
+        markets = {}
 
     wb = Workbook()
     ws = wb.active
@@ -250,9 +311,8 @@ def main():
         ws.auto_filter.ref = f"A{first - 1}:Y{last}"
     set_font(ws)
     wb.save(a.out)
-    print(f"Wrote {a.out}: {len(bets)} bets")
+    print(f"Wrote {a.out}: {len(bets)} bets, {len(markets)} markets priced")
 
 
 if __name__ == "__main__":
     main()
-
